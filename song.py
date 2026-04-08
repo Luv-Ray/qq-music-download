@@ -22,7 +22,11 @@ from mutagen.id3 import ID3, TIT2, TPE1, TALB, APIC, USLT
 ## 配置常量
 class Config:
     COVER_SIZE = 800 #封面尺寸[150, 300, 500, 800]
-    DOWNLOAD_TIMEOUT = 30
+    DOWNLOAD_CONNECT_TIMEOUT = 10
+    DOWNLOAD_TIMEOUT = 120  # 单次 socket 读取超时(秒)
+    MAX_RETRIES = 3
+    RETRY_BASE_DELAY = 1.5
+    RETRY_MAX_DELAY = 8
     CREDENTIAL_FILE = Path("qqmusic_cred.pkl")
     MUSIC_DIR = Path("./music")
     MIN_FILE_SIZE = 1024
@@ -76,13 +80,26 @@ class NetworkManager:
     async def get_session(self):
         """获取会话的上下文管理器"""
         if self.session is None:
-            timeout = aiohttp.ClientTimeout(total=Config.DOWNLOAD_TIMEOUT)
+            timeout = aiohttp.ClientTimeout(
+                total=None,
+                connect=Config.DOWNLOAD_CONNECT_TIMEOUT,
+                sock_connect=Config.DOWNLOAD_CONNECT_TIMEOUT,
+                sock_read=Config.DOWNLOAD_TIMEOUT,
+            )
             self.session = aiohttp.ClientSession(timeout=timeout)
 
         try:
             yield self.session
+        except asyncio.TimeoutError as e:
+            raise DownloadError(
+                f"下载超时（连接{Config.DOWNLOAD_CONNECT_TIMEOUT}s，读取{Config.DOWNLOAD_TIMEOUT}s）"
+            ) from e
+        except aiohttp.ClientError as e:
+            err = str(e).strip() or type(e).__name__
+            raise DownloadError(f"网络请求失败: {err}") from e
         except Exception as e:
-            raise DownloadError(f"网络请求失败: {e}")
+            err = str(e).strip() or type(e).__name__
+            raise DownloadError(f"网络请求失败: {err}") from e
 
     async def close(self):
         """关闭会话"""
@@ -594,11 +611,30 @@ class QQMusicSingleDownloader:
             (SongFileType.MP3_128, "MP3 128kbps"),
         ]),
     }
+    RETRYABLE_STATUS_CODES = {408, 429, 500, 502, 503, 504}
 
     def _get_quality_strategy(self) -> List[Tuple[SongFileType, str]]:
         """获取音质下载策略"""
         _, fallback_chain = self.QUALITY_OPTIONS.get(self.quality_level, self.QUALITY_OPTIONS[3])
         return fallback_chain
+
+    @staticmethod
+    def _should_retry_status(status_code: int) -> bool:
+        return status_code in QQMusicSingleDownloader.RETRYABLE_STATUS_CODES
+
+    @staticmethod
+    def _get_retry_delay(attempt: int) -> float:
+        delay = Config.RETRY_BASE_DELAY * (2 ** (attempt - 1))
+        return min(delay, Config.RETRY_MAX_DELAY)
+
+    @staticmethod
+    def _format_exception_message(error: Exception) -> str:
+        if isinstance(error, asyncio.TimeoutError):
+            return f"下载超时（连接{Config.DOWNLOAD_CONNECT_TIMEOUT}s，读取{Config.DOWNLOAD_TIMEOUT}s）"
+        message = str(error).strip()
+        if message:
+            return message
+        return type(error).__name__
 
     async def download_song(self, song_data: Dict[str, Any]) -> bool:
         """下载单首歌曲"""
@@ -631,35 +667,53 @@ class QQMusicSingleDownloader:
             return False
 
         except Exception as e:
-            logger.error(f"下载歌曲失败: {e}")
+            logger.error(f"下载歌曲失败: {self._format_exception_message(e)}")
             return False
 
     async def _download_with_quality(self, song_info: SongInfo, file_type: SongFileType,
                                      quality_name: str, file_path: Path, song_data: Dict[str, Any]) -> bool:
         """使用指定音质下载"""
         print(f"尝试下载 {quality_name}: {song_info.singer} - {song_info.name}{' [VIP]' if song_info.is_vip else ''}")
+        max_retries = Config.MAX_RETRIES
 
-        urls = await get_song_urls([song_info.mid], file_type=file_type,
-                                   credential=self.credential)
-        url = urls.get(song_info.mid)
+        for attempt in range(1, max_retries + 1):
+            err_msg = "未知错误"
+            try:
+                urls = await get_song_urls([song_info.mid], file_type=file_type,
+                                           credential=self.credential)
+                url = urls.get(song_info.mid)
 
-        if not url:
-            print(f"无法获取歌曲URL ({quality_name})")
-            return False
+                if not url:
+                    print(f"无法获取歌曲URL ({quality_name})")
+                    return False
 
-        async with self.network.get_session() as session:
-            async with session.get(url) as response:
-                if response.status == 200:
-                    content = await response.read()
-                    if len(content) > Config.MIN_FILE_SIZE:
-                        await self._save_file(file_path, content)
-                        await self._add_metadata(file_path, song_info, song_data)
-                        print(f"下载成功: ---> {file_path.name}")
-                        return True
-                    else:
-                        print("文件过小，可能下载失败")
-                else:
-                    print(f"下载失败，状态码: {response.status}")
+                async with self.network.get_session() as session:
+                    async with session.get(url) as response:
+                        if response.status == 200:
+                            content = await response.read()
+                            if len(content) > Config.MIN_FILE_SIZE:
+                                await self._save_file(file_path, content)
+                                await self._add_metadata(file_path, song_info, song_data)
+                                print(f"下载成功: ---> {file_path.name}")
+                                return True
+                            err_msg = "文件过小，可能下载失败"
+                            print("文件过小，可能下载失败")
+                        else:
+                            err_msg = f"HTTP {response.status}"
+                            print(f"下载失败，状态码: {response.status}")
+                            if not self._should_retry_status(response.status):
+                                return False
+
+            except Exception as e:
+                err_msg = self._format_exception_message(e)
+                if attempt >= max_retries:
+                    print(f"下载异常: {err_msg}")
+                    return False
+
+            if attempt < max_retries:
+                delay = self._get_retry_delay(attempt)
+                print(f"第 {attempt} 次下载失败（{err_msg}），{delay:.1f} 秒后重试...")
+                await asyncio.sleep(delay)
 
         return False
 
